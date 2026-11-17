@@ -1,4 +1,6 @@
 // agent-runtime 平面与登录归一的单测（网络全部打桩，不碰真上游）。
+// 默认对话通路已是网页 aigc 平面；这里显式切回桌面平面来覆盖它的逻辑。
+process.env.MAGPIE_LINGXI_PLANE = "agent"
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { WPSLingxiAuthPlugin, _internal } from '../index.mjs'

@@ -39,9 +39,10 @@ test('the agent plane keeps wps_sid and uid, drops the rest', () => {
   assert.equal(resolveCookie({ cookie: `wps_sid=${SID}; uid=7; kso_sid=x` }), `wps_sid=${SID}; uid=7`)
 })
 
-test('_internal has no web-plane helpers', () => {
-  for (const name of ['toolProtocolPrompt', 'createToolCallParser', 'fetchLiveModels']) {
-    assert.equal(name in _internal, false, `_internal should not export ${name}`)
+// 2026-11 起对话主通路回到网页 aigc 平面，网页平面的辅助函数重新导出。
+test('_internal exposes the web-plane helpers the chat path needs', () => {
+  for (const name of ['aigcChat', 'aigcQuestion', 'createToolCallParser', 'thinkingModeFor']) {
+    assert.equal(typeof _internal[name], 'function', `_internal should export ${name}`)
   }
   for (const name of ['extractSid', 'normalizeCredential', 'resolveCookie', 'identityOf']) {
     assert.equal(typeof _internal[name], 'function', `_internal should export ${name}`)

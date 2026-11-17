@@ -1411,6 +1411,883 @@ function chatErrorStatus(error) {
   return status >= 500 ? status : 502
 }
 
+// ── 网页 aigc 平面（/api/aigc/v3/assistant/*）────────────────────────────
+// 2026-11：上游对 agent-runtime 平面全量返回 403 PermissionDenied（官方桌面端
+// 同样被拒），且 cowork_web WS 平面按次结算智点。网页 aigc 平面实测：
+// 两个账号全通、长对话、多轮（服务端按 session 记忆）、0 智点消耗。
+// 它是纯 HTTP SSE：建会话 → POST completions，一个 question 字符串进出。
+// 工具调用走提示词级桥接（信封标记），是有损降级，不承诺原生 tool_calls。
+
+const TOOL_CALL_BEGIN = "<|FunctionCallBegin|>"
+const TOOL_CALL_END = "<|FunctionCallEnd|>"
+// 漂移方言：模型会照训练数据里的信封吐 <tool_call>（Hermes/Qwen）或
+// <tool_calls><invoke>（Anthropic 风格）；Kimi 还会用 </seed:tool_call> 收尾。
+// 不认这些，整块就被当正文漏出去（"错版"）。
+const TOOL_CALL_BEGINS = [TOOL_CALL_BEGIN, "<tool_call>", "<tool_calls>"]
+const TOOL_CALL_ENDS = [TOOL_CALL_END, "</tool_call>", "</tool_calls>", "</seed:tool_call>", "<|tool_call_end|>"]
+const TOOL_CALL_MAX_BUFFER = 1 << 20
+const TOOL_BRIDGE_ENABLED = process.env.MAGPIE_LINGXI_TOOL_BRIDGE !== "0"
+const AIGC_SESSIONS_PATH = "/api/aigc/v3/assistant/sessions"
+
+const THINKING_OVERRIDE = process.env.MAGPIE_LINGXI_THINKING || ""
+const WITH_MCP = process.env.MAGPIE_LINGXI_WITH_MCP === "1"
+
+function thinkingModeFor(effort) {
+  if (THINKING_OVERRIDE === "auto" || THINKING_OVERRIDE === "disabled" || THINKING_OVERRIDE === "off") return THINKING_OVERRIDE
+  return effort === "0" ? "disabled" : "auto"
+}
+
+function contentToText(content) {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === "string") return part
+      if (part?.type === "image" || part?.type === "image_url" || part?.type === "input_image") return "[image]"
+      return part?.text ?? ""
+    }).join("")
+  }
+  if (content == null) return ""
+  return JSON.stringify(content)
+}
+
+function normalizeTools(raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  for (const item of raw) {
+    const fn = item?.type === "function" ? item.function : (item?.function ?? item)
+    if (!fn || typeof fn.name !== "string" || !fn.name.trim()) continue
+    const description = typeof fn.description === "string" ? fn.description : ""
+    out.push({
+      name: fn.name,
+      description: description.length > 240 ? `${description.slice(0, 240)}…` : description,
+      parameters: fn.parameters ?? { type: "object", properties: {} },
+    })
+  }
+  return out
+}
+
+// 按 schema 生成最小参数示例：required 优先，按类型给占位值。
+function minimalArgs(schema) {
+  const props = schema?.properties && typeof schema.properties === "object" ? schema.properties : {}
+  const keys = Array.isArray(schema?.required) && schema.required.length
+    ? schema.required : Object.keys(props)
+  const pick = { string: "", integer: 1, number: 1, boolean: true, object: {}, array: [] }
+  const args = {}
+  for (const key of keys.slice(0, 4)) {
+    const raw = props[key]?.type
+    const type = Array.isArray(raw) ? raw.find((t) => t !== "null") : raw
+    args[key] = Object.hasOwn(pick, type) ? pick[type] : ""
+  }
+  return args
+}
+
+function toolChoiceRule(choice) {
+  const named = forcedToolName(choice)
+  if (named) return `本轮必须调用工具 ${named}，不得调用其它工具。`
+  if (choice === "required" || choice?.type === "required") return "本轮必须至少调用一个工具再作答。"
+  return ""
+}
+
+function toolProtocolPrompt(tools, choice) {
+  const lines = [
+    "[工具协议 · 内部约定，不要向用户复述]",
+    "你可以调用下列工具。需要调用时，只输出一个标记块，格式严格如下：",
+    `${TOOL_CALL_BEGIN}[{"name":"<工具名>","parameters":{...}}]${TOOL_CALL_END}`,
+    "规则：工具名与参数名必须与下面的 schema 完全一致；parameters 必须是 JSON 对象；",
+    "一次可以调用多个工具（数组里放多个对象）；标记块之后不要再输出解释，等待工具结果。",
+    `禁止使用 <function name="..."><parameter name="..."> 这种 XML 写法，也禁止用 </seed:tool_call> 之类的标记收尾；`,
+    `结束标记只能是 ${TOOL_CALL_END}，标记块里面只能是 JSON 数组，不能是 XML。`,
+    "可用工具：",
+    JSON.stringify(tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }))),
+  ]
+  // 具体示例比纯 prose 更容易被模仿；最多给两个工具各一行。
+  for (const tool of tools.slice(0, 2)) {
+    const block = `${TOOL_CALL_BEGIN}${JSON.stringify([{ name: tool.name, parameters: minimalArgs(tool.parameters) }])}${TOOL_CALL_END}`
+    lines.push(`示例（${tool.name}）：${block}`)
+  }
+  // 工具结果回来后模型常只描述计划不发调用；这句针对该停摆。
+  lines.push("工具结果返回后，如果任务还没完成，立刻发起下一个工具调用；不要只描述你准备做什么就结束回合。")
+  const rule = toolChoiceRule(choice)
+  if (rule) lines.push(rule)
+  return lines.join("\n")
+}
+
+function nativeCallBlock(toolCalls) {
+  if (!Array.isArray(toolCalls) || !toolCalls.length) return ""
+  const entries = []
+  for (const call of toolCalls) {
+    const fn = call?.function ?? call ?? {}
+    let parameters = {}
+    if (typeof fn.arguments === "string") {
+      try { parameters = JSON.parse(fn.arguments) } catch { parameters = { raw: fn.arguments } }
+    } else if (fn.arguments && typeof fn.arguments === "object") {
+      parameters = fn.arguments
+    }
+    if (fn.name) entries.push({ name: fn.name, parameters })
+  }
+  if (!entries.length) return ""
+  return `${TOOL_CALL_BEGIN}${JSON.stringify(entries)}${TOOL_CALL_END}`
+}
+
+function parseNativeToolCalls(payload, allowed) {
+  const json = parseJsonToolCalls(payload, allowed)
+  if (json) return json
+  return parseXmlToolCalls(payload, allowed)
+}
+
+function parseJsonToolCalls(payload, allowed) {
+  let parsed
+  try { parsed = JSON.parse(payload) } catch { return null }
+  const list = Array.isArray(parsed) ? parsed : [parsed]
+  if (!list.length || !allowed.size) return null
+  const calls = []
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") return null
+    const name = entry.name ?? entry.tool ?? entry.function?.name
+    const params = entry.parameters ?? entry.arguments ?? entry.function?.arguments
+    if (typeof name !== "string" || !allowed.has(name)) return null
+    let args
+    if (typeof params === "string") {
+      try { JSON.parse(params) } catch { return null }
+      args = params
+    } else if (params && typeof params === "object" && !Array.isArray(params)) {
+      args = JSON.stringify(params)
+    } else {
+      return null
+    }
+    calls.push({ name, arguments: args })
+  }
+  return calls
+}
+
+// GLM 系列在网页通路的方言：外壳不是 <function name="…">，而是
+// <|FunctionCallBegin|><parameter name="terminal"><parameter name="command"…>…
+// 参数值里还会嵌套同名标签、引号、&&、尖括号。非贪婪正则在这里整块匹配失败，
+// 工具调用就被吐回正文（用户看到的"错版"）。所以外壳和子参数都改为
+// 按同名标签深度计数取配对内容，不再依赖正则边界。
+function matchedShell(text, openTag) {
+  const tokenRe = new RegExp(`<${openTag}(?:\\s[^>]*)?>|</${openTag}>`, "g")
+  const first = tokenRe.exec(text)
+  if (!first || first[0].startsWith("</")) return null
+  let depth = 1
+  let t
+  while ((t = tokenRe.exec(text))) {
+    if (t[0].startsWith("</")) depth -= 1
+    else depth += 1
+    if (depth === 0) return { inner: text.slice(first.index + first[0].length, t.index), end: tokenRe.lastIndex }
+  }
+  return null
+}
+
+function parseParamChildren(inner) {
+  // 子参数：<parameter name="k" string="true|false">v</parameter>，值里可再嵌 parameter。
+  const params = {}
+  let i = 0
+  while (i < inner.length) {
+    const open = /<parameter\s+name\s*=\s*"([^"]*)"(?:\s+string\s*=\s*"(true|false)")?\s*>/.exec(inner.slice(i))
+    if (!open) break
+    const key = open[1].trim()
+    const isString = open[2] !== "false"
+    const start = i + open.index + open[0].length
+    // 找配对的 </parameter>：值里可能嵌同名标签，深度计数。
+    let depth = 1
+    let j = start
+    const tagRe = /<\/?parameter(?:\s[^>]*)?>/g
+    tagRe.lastIndex = start
+    let t
+    let end = -1
+    while ((t = tagRe.exec(inner))) {
+      if (t[0].startsWith("</")) depth -= 1
+      else depth += 1
+      if (depth === 0) { end = t.index; break }
+    }
+    if (end < 0) return null // 未闭合，拒绝整块
+    const raw = inner.slice(start, end)
+    if (isString) {
+      params[key] = raw
+    } else {
+      try { params[key] = JSON.parse(raw) } catch { params[key] = raw }
+    }
+    i = end + t[0].length
+  }
+  return params
+}
+
+function parseXmlToolCalls(payload, allowed) {
+  if (!allowed.size) return null
+  // 三种外壳：<function name="x">…（Kimi/Qwen）、<parameter name="x">…（GLM），
+  // 以及 <invoke name="x">…（Anthropic 风格的 <tool_calls> 信封）。
+  if (!/<(?:function|parameter|invoke)\s+name\s*=/.test(payload)) return null
+  // 非贪婪正则在参数值嵌套同名标签时会截断（GLM 的 command 值里可以再嵌
+  // <parameter>），所以统一走深度计数，正则路径只处理无嵌套的简单情形。
+  const shells = []
+  let probe = payload
+  while (true) {
+    const head = /<(function|parameter|invoke)\s+name\s*=\s*"([^"]*)"/.exec(probe)
+    if (!head) break
+    const tag = head[1]
+    const name = head[2].trim()
+    const shell = matchedShell(probe, tag, name)
+    if (!shell) break
+    shells.push({ name, inner: shell.inner })
+    probe = probe.slice(shell.end)
+  }
+  if (!shells.length) return null
+  const calls = []
+  for (const shell of shells) {
+    if (!shell.name || !allowed.has(shell.name)) return null
+    const params = parseParamChildren(shell.inner)
+    if (!params) return null
+    calls.push({ name: shell.name, arguments: JSON.stringify(params) })
+  }
+  return calls.length ? calls : null
+}
+
+function partialMarkerLength(text, markers) {
+  let best = 0
+  for (const marker of markers) {
+    const max = Math.min(text.length, marker.length - 1)
+    for (let n = max; n > best; n--) {
+      if (text.endsWith(marker.slice(0, n))) { best = n; break }
+    }
+  }
+  return best
+}
+
+// 上游被 token 上限/心跳截断时，JSON 块会缺尾括号或引号。先本地补全再解析：
+// 比把半截信封吐回正文（用户看到的"错版"）更接近模型本意。结构错乱就返回 null，
+// 交给上层原样吐正文，不瞎猜。
+function closeUnbalancedJson(text) {
+  const at = text.search(/[[{]/)
+  if (at < 0) return null
+  const stack = []
+  let inString = false, escaped = false
+  for (let i = at; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (inString) {
+      if (ch === "\\") escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === "{" || ch === "[") stack.push(ch === "{" ? "}" : "]")
+    else if (ch === "}" || ch === "]") {
+      if (stack.pop() !== ch) return null
+    }
+  }
+  if (!stack.length && !inString) return null // 本来就平衡：不是截断，别补
+  let tail = text.slice(at)
+  if (inString) tail += '"'
+  tail = tail.replace(/[,:]\s*$/, "")
+  return tail + stack.reverse().join("")
+}
+
+function parsePayload(payload, allowed) {
+  const calls = parseNativeToolCalls(payload, allowed)
+  if (calls) return calls
+  const repaired = closeUnbalancedJson(payload)
+  return repaired ? parseNativeToolCalls(repaired, allowed) : null
+}
+
+function createToolCallParser(allowedNames) {
+  const allowed = allowedNames instanceof Set ? allowedNames : new Set(allowedNames || [])
+  let buffer = ""
+  let inCall = false
+  let openMarker = TOOL_CALL_BEGIN
+
+  function drain(out, final) {
+    for (;;) {
+      if (!inCall) {
+        const begin = TOOL_CALL_BEGINS
+          .map((marker) => ({ marker, at: buffer.indexOf(marker) }))
+          .filter((x) => x.at >= 0)
+          .sort((a, b) => a.at - b.at || b.marker.length - a.marker.length)[0]
+        if (begin) {
+          if (begin.at > 0) out.push({ type: "text", value: buffer.slice(0, begin.at) })
+          buffer = buffer.slice(begin.at + begin.marker.length)
+          inCall = true
+          openMarker = begin.marker
+          continue
+        }
+        const hold = final ? 0 : partialMarkerLength(buffer, TOOL_CALL_BEGINS)
+        const cut = buffer.length - hold
+        if (cut > 0) {
+          out.push({ type: "text", value: buffer.slice(0, cut) })
+          buffer = buffer.slice(cut)
+        }
+        return
+      }
+      const hit = TOOL_CALL_ENDS
+        .map((marker) => ({ marker, at: buffer.indexOf(marker) }))
+        .filter((x) => x.at >= 0)
+        .sort((a, b) => a.at - b.at)[0]
+      if (hit) {
+        const payload = buffer.slice(0, hit.at)
+        buffer = buffer.slice(hit.at + hit.marker.length)
+        inCall = false
+        const calls = parsePayload(payload, allowed)
+        if (calls) out.push({ type: "calls", calls })
+        else if (payload) out.push({ type: "text", value: openMarker + payload + hit.marker })
+        continue
+      }
+      if (buffer.length > TOOL_CALL_MAX_BUFFER) {
+        out.push({ type: "text", value: openMarker + buffer })
+        buffer = ""
+        inCall = false
+        return
+      }
+      return
+    }
+  }
+
+  return {
+    push(chunk) {
+      const out = []
+      buffer += chunk
+      drain(out, false)
+      return out
+    },
+    flush() {
+      const out = []
+      drain(out, true)
+      if (inCall) {
+        const calls = parsePayload(buffer, allowed)
+        if (calls) out.push({ type: "calls", calls })
+        else if (buffer) out.push({ type: "text", value: openMarker + buffer })
+      } else if (buffer) {
+        out.push({ type: "text", value: buffer })
+      }
+      buffer = ""
+      inCall = false
+      return out
+    },
+  }
+}
+
+// 压平：messages → SYSTEM/TOOLS/历史/请求 四段一个 question 字符串。
+// 历史从最老整条丢，assistant tool_calls 与 tool 结果必须成对，不能挖洞。
+function aigcQuestion(body, tools) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  // OpenAI 的 tool 消息常常只带 tool_call_id 不带 name；从历史里的 assistant
+  // 调用建 id→name 映射，结果才能标对工具名（模型据此判断是哪个工具返回的）。
+  const callNames = new Map()
+  for (const m of messages) {
+    if (m?.role !== "assistant" || !Array.isArray(m.tool_calls)) continue
+    for (const call of m.tool_calls) {
+      if (call?.id && call?.function?.name) callNames.set(call.id, call.function.name)
+    }
+  }
+  const renderMessage = (m) => {
+    const text = contentToText(m?.content)
+    if (m?.role === "assistant") {
+      const rendered = [text, nativeCallBlock(m.tool_calls)].filter(Boolean).join("\n")
+      return rendered ? `Assistant: ${rendered}` : ""
+    }
+    if (m?.role === "tool" || m?.role === "function") {
+      const label = callNames.get(m?.tool_call_id) || m?.name || m?.tool_call_id || "tool"
+      return `Tool (${label}): ${text}`
+    }
+    return `User: ${text}`
+  }
+
+  const systemTexts = []
+  for (const m of messages) {
+    if (m?.role !== "system" && m?.role !== "developer") continue
+    const text = contentToText(m.content).trim()
+    if (text && !systemTexts.includes(text)) systemTexts.push(text)
+  }
+
+  const trailing = messages.length ? messages[messages.length - 1] : null
+  const endsWithUser = trailing?.role === "user"
+  let request
+  let historyMessages = messages
+  if (endsWithUser) {
+    request = contentToText(trailing.content)
+    historyMessages = messages.slice(0, -1)
+  } else if (!messages.length) {
+    request = "你好"
+  } else if (trailing?.role === "tool" || trailing?.role === "function") {
+    // 只会在"结果回来就继续调用"停摆；同一工具换参数再调是正常的，别禁。
+    request = "（工具结果已返回。如果任务还没完成，立刻发起下一个工具调用；不要只描述接下来要做什么。）"
+  } else {
+    request = "（请继续。）"
+  }
+
+  const history = []
+  let elided = 0
+  for (const m of historyMessages) {
+    const role = m?.role
+    if (role === "system" || role === "developer") continue
+    const line = renderMessage(m)
+    if (!line) continue
+    if (byteLength(line) > MAX_MESSAGE_BYTES) {
+      elided += 1
+      history.push(headTailBytes(line, MAX_MESSAGE_BYTES))
+    } else {
+      history.push(line)
+    }
+  }
+
+  const systemSection = systemTexts.length ? `SYSTEM:\n${systemTexts.join("\n\n")}` : ""
+  const toolsSection = tools.length ? `TOOLS:\n${toolProtocolPrompt(tools, body?.tool_choice)}` : ""
+  const requestSection = `User: ${request}`
+
+  const fixedBytes = byteLength([systemSection, toolsSection, requestSection].filter(Boolean).join("\n\n"))
+  if (fixedBytes > MAX_PROMPT_BYTES) {
+    const error = new Error(
+      `本轮请求本身就超过上游长度上限（${(fixedBytes / 1024).toFixed(0)}KB > ${MAX_PROMPT_KB}KB）：` +
+      `SYSTEM/工具清单/当前消息太大。可调大 MAGPIE_LINGXI_MAX_PROMPT_KB。`,
+    )
+    error.code = "prompt_token_exceed_limit"
+    error.status = 400
+    throw error
+  }
+
+  let totalBytes = fixedBytes + (history.length ? byteLength(history.join("\n\n")) + 2 : 0)
+  let start = 0
+  while (totalBytes > MAX_PROMPT_BYTES && start < history.length) {
+    totalBytes -= byteLength(history[start]) + 2
+    start += 1
+  }
+  const keptHistory = history.slice(start)
+  const dropped = start
+
+  const sections = []
+  if (systemSection) sections.push(systemSection)
+  if (toolsSection) sections.push(toolsSection)
+  if (dropped > 0 || elided > 0) {
+    const notes = []
+    if (dropped > 0) notes.push(`更早的 ${dropped} 条消息被省略`)
+    if (elided > 0) notes.push(`${elided} 条过长消息被截断`)
+    sections.push(`[历史已压缩：${notes.join("，")}（上游单次请求长度上限 ${MAX_PROMPT_KB}KB）]`)
+  }
+  if (keptHistory.length) sections.push(keptHistory.join("\n\n"))
+  sections.push(requestSection)
+  return sections.join("\n\n")
+}
+
+// tool_choice 强制指定的工具名；非 named 形态返回空串。
+function forcedToolName(choice) {
+  if (!choice || choice === "auto" || choice === "none" || choice === "required" || choice?.type === "required") return ""
+  const named = choice?.function?.name ?? (typeof choice === "string" ? "" : choice?.name)
+  return typeof named === "string" && named.trim() ? named : ""
+}
+
+// 工具轮分类：clean 直接放行；broken/empty/forced 重问一轮（有界，至多一次）。
+// 靠提示词桥的模型没有原生保证，坏轮次是常态而非理论情况（用户实测确认）。
+function classifyToolRound(round, forcedName, requiresCall) {
+  if ((round.toolCalls || []).length) return "clean"
+  const content = (round.content || "").trim()
+  if (!content) return "empty"
+  if (forcedName || requiresCall) return "forced"
+  // 解析失败的信封会被 parser 原样吐回正文：正文里还有开始标记就是坏轮次。
+  if (TOOL_CALL_BEGINS.some((marker) => content.includes(marker))) return "broken"
+  return "clean"
+}
+
+const RETRY_SNIPPET_BYTES = 2000
+
+function retryQuestion(question, round, kind, forcedName) {
+  const snippet = (round.content || "").slice(-RETRY_SNIPPET_BYTES)
+  if (kind === "empty") {
+    return `${question}\n\n[系统提示]你的上一条回复是空的。请重新作答；如需使用工具，严格按工具协议输出调用标记块。`
+  }
+  if (kind === "forced") {
+    return `${question}\n\n[系统提示]你的上一条回复没有调用工具，不符合本轮要求（必须调用 ${forcedName || "一个工具"}）。请重新回复，只输出工具调用标记块。`
+  }
+  return `${question}\n\n[系统提示]你上一条回复里的工具调用格式无法解析，原文附后。请严格按工具协议重新输出完整的调用标记块，不要额外解释：\n${snippet}`
+}
+
+// aigc SSE 状态机：event:/data: 帧方言 → OpenAI chunk 对象，交给注入的 write。
+// 直通管道把 write 编码成 SSE 字节；缓冲路径把 write 存进数组。两条路共享同一套解析。
+function createAigcFold(toolNames, requestedModel) {
+  const decoder = new TextDecoder()
+  const completionId = `chatcmpl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  let lineBuffer = "", eventName = "", dataLines = []
+  let sawError = false, ended = false, tailEvents = []
+  let upstreamError = { message: "Upstream stream ended without a completion marker", type: "upstream_error", code: "incomplete_stream" }
+  const toolParser = createToolCallParser(toolNames)
+  let toolCallCount = 0
+  const chunk = (delta, finishReason = null) => ({
+    id: completionId, object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000), model: requestedModel,
+    choices: [{ delta, index: 0, finish_reason: finishReason }],
+  })
+  const writeEvents = (write, events) => {
+    for (const event of events) {
+      if (event.type === "text") {
+        if (event.value) write(chunk({ content: event.value }))
+        continue
+      }
+      for (const call of event.calls) {
+        const index = toolCallCount++
+        write(chunk({
+          tool_calls: [{
+            index,
+            id: `call_${completionId.slice(-13)}_${index}`,
+            type: "function",
+            function: { name: call.name, arguments: call.arguments },
+          }],
+        }))
+      }
+    }
+  }
+  const fail = (write, detail) => {
+    if (sawError) return
+    sawError = true
+    // aigc 错误帧是 { result, msg }，不是 { code, message }。
+    const code = detail?.code || detail?.result || "upstream_error"
+    const message = detail?.message || detail?.msg || detail?.hint || detail?.result || "WPS Lingxi upstream error"
+    upstreamError = { message: String(message), type: "upstream_error", code: String(code) }
+    write({ error: upstreamError })
+  }
+  const dispatch = (write) => {
+    const raw = dataLines.join("\n")
+    const name = eventName
+    eventName = ""; dataLines = []
+    if (sawError) return
+    let item
+    try { item = raw ? JSON.parse(raw) : null } catch {
+      fail(write, { message: "Malformed upstream SSE data", code: "invalid_sse" })
+      return
+    }
+    if (name === "error") { fail(write, item?.error || item); return }
+    if (!item) return
+    if (item.type === "error") { fail(write, item.error || item.data || item); return }
+    if (ended) return
+    if (item.type === "reasoning" || item.type === "text") {
+      const value = typeof item.data === "object" ? item.data?.text || "" : String(item.data ?? "")
+      if (item.type === "text") writeEvents(write, toolParser.push(value))
+      else write(chunk({ reasoning_content: value }))
+      return
+    }
+    if (item.type === "end" || item.type === "text_end") {
+      // 尾部事件（含未解析的坏块）先扣着不发：调用方要据此决定透传还是重问。
+      ended = true
+      tailEvents = toolParser.flush()
+    }
+  }
+  const parse = (text, write, final = false) => {
+    lineBuffer += text
+    while (true) {
+      const match = /[\r\n]/.exec(lineBuffer)
+      if (!match || (!final && match[0] === "\r" && match.index === lineBuffer.length - 1)) break
+      const line = lineBuffer.slice(0, match.index)
+      const width = lineBuffer.slice(match.index, match.index + 2) === "\r\n" ? 2 : 1
+      lineBuffer = lineBuffer.slice(match.index + width)
+      if (!line) dispatch(write)
+      else if (line.startsWith("event:")) eventName = line.slice(6).trim()
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""))
+    }
+    if (final) {
+      if (lineBuffer.startsWith("data:")) dataLines.push(lineBuffer.slice(5).replace(/^ /, ""))
+      else if (lineBuffer.startsWith("event:")) eventName = lineBuffer.slice(6).trim()
+      if (eventName || dataLines.length) dispatch(write)
+    }
+  }
+  return {
+    feed(bytes, write) { parse(decoder.decode(bytes, { stream: true }), write) },
+    finish(write) {
+      parse(decoder.decode(), write, true)
+      if (!ended && !sawError) fail(write, upstreamError)
+    },
+    // 轮末仍未发出的尾巴（正常为空；坏块此时是 text 事件）。
+    tail() {
+      return { events: tailEvents, text: tailEvents.filter((e) => e.type === "text").map((e) => e.value).join("") }
+    },
+    // 放行尾巴 + 结束帧（tool_calls / stop）。
+    complete(write) {
+      writeEvents(write, tailEvents)
+      write(chunk({}, toolCallCount ? "tool_calls" : "stop"))
+    },
+    sawError: () => sawError,
+    error: () => upstreamError,
+  }
+}
+
+// 建会话 → completions → 整轮读完聚合。非流式与工具轮走这里：工具轮必须完整
+// 拿在手里才能分类重试，完整性优先于流式体验。
+async function consumeAigcRound({ base, cookie, payload, requestedModel, toolNames, signal }) {
+  const sessionId = await aigcCreateSession(base, cookie, signal)
+  const cleanup = () => {
+    fetch(`${base}${AIGC_SESSIONS_PATH}/${sessionId}`, { method: "DELETE", headers: aigcHeaders(cookie, base) }).catch(() => {})
+  }
+  let upstream
+  try {
+    upstream = await fetch(`${base}${AIGC_SESSIONS_PATH}/${sessionId}/completions`, {
+      method: "POST",
+      headers: { ...aigcHeaders(cookie, base), Accept: "text/event-stream" },
+      body: JSON.stringify(payload),
+      signal,
+    })
+  } catch (error) {
+    cleanup()
+    throw error
+  }
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => "")
+    let errorBody
+    try { errorBody = JSON.parse(text) } catch { errorBody = { message: text } }
+    const error = new Error(`WPS 灵犀网页上游响应异常: HTTP ${upstream.status}${text ? `：${text.slice(0, 200)}` : ""}`)
+    error.status = upstream.status
+    if (isAuditError(errorBody)) error.code = "audit_blocked"
+    cleanup()
+    throw error
+  }
+  if (!upstream.body) { cleanup(); throw new Error("WPS 灵犀网页上游没有返回响应体") }
+
+  const fold = createAigcFold(toolNames, requestedModel)
+  const chunks = []
+  const write = (value) => chunks.push(value)
+  try {
+    const reader = upstream.body.getReader()
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        fold.feed(value, write)
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    fold.finish(write)
+    if (!fold.sawError()) fold.complete(write)
+  } catch (error) {
+    signal?.throwIfAborted()
+    cleanup()
+    return { error: { message: "WPS 灵犀上游流中断", code: "incomplete_stream" } }
+  }
+  cleanup()
+  if (fold.sawError()) return { error: fold.error() }
+  let content = "", reasoning = ""
+  const toolCalls = []
+  for (const value of chunks) {
+    const delta = value.choices?.[0]?.delta
+    if (!delta) continue
+    content += delta.content || ""
+    reasoning += delta.reasoning_content || ""
+    for (const call of delta.tool_calls || []) {
+      const slot = (toolCalls[call.index] ??= { id: call.id, type: "function", function: { name: "", arguments: "" } })
+      if (call.id) slot.id = call.id
+      if (call.function?.name) slot.function.name += call.function.name
+      if (call.function?.arguments) slot.function.arguments += call.function.arguments
+    }
+  }
+  return { content, reasoning, toolCalls }
+}
+
+// 无工具的流式直通：上游 SSE 边到边转 OpenAI chunk，零缓冲。
+// 一轮回答回放成 SSE 帧（工具调用闭合后立即用；重问整轮也用）。
+function roundFrames(round, requestedModel) {
+  const completionId = `chatcmpl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const frames = []
+  const push = (delta, finishReason = null) => frames.push(
+    `data: ${JSON.stringify({
+      id: completionId, object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000), model: requestedModel,
+      choices: [{ delta, index: 0, finish_reason: finishReason }],
+    })}\n\n`,
+  )
+  push({ role: "assistant" })
+  if (round.reasoning) push({ reasoning_content: round.reasoning })
+  if (round.content) push({ content: round.content })
+  round.toolCalls.forEach((call, index) => push({
+    tool_calls: [{
+      index,
+      id: call.id || `call_${completionId.slice(-13)}_${index}`,
+      type: "function",
+      function: { name: call.function.name, arguments: call.function.arguments },
+    }],
+  }))
+  push({}, round.toolCalls.length ? "tool_calls" : "stop")
+  frames.push("data: [DONE]\n\n")
+  return frames
+}
+
+// 流式直通：正文边到边推；工具调用块由 parser 扣住，闭合解析成功立即作为
+// tool_calls 帧推出。只有轮末仍没解析出来的坏块会等到这里：本地补全已经试过，
+// 若整轮一个字都没推出去，才有界重问一次；否则原样透传（收不回来的字没法重试）。
+async function aigcStreamThrough({ base, cookie, payload, question, makePayload, requestedModel, toolNames, forcedName, requiresCall, signal }) {
+  const sessionId = await aigcCreateSession(base, cookie, signal)
+  const encoder = new TextEncoder()
+  const upstream = await fetch(`${base}${AIGC_SESSIONS_PATH}/${sessionId}/completions`, {
+    method: "POST",
+    headers: { ...aigcHeaders(cookie, base), Accept: "text/event-stream" },
+    body: JSON.stringify(payload),
+    signal,
+  })
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => "")
+    let errorBody
+    try { errorBody = JSON.parse(text) } catch { errorBody = { message: text } }
+    const error = new Error(`WPS 灵犀网页上游响应异常: HTTP ${upstream.status}${text ? `：${text.slice(0, 200)}` : ""}`)
+    error.status = upstream.status
+    if (isAuditError(errorBody)) error.code = "audit_blocked"
+    // 会话用完即弃；删不掉也不影响后续（每次请求都新建）。
+    fetch(`${base}${AIGC_SESSIONS_PATH}/${sessionId}`, { method: "DELETE", headers: aigcHeaders(cookie, base) }).catch(() => {})
+    throw error
+  }
+  if (!upstream.body) throw new Error("WPS 灵犀网页上游没有返回响应体")
+  const cleanup = () => {
+    fetch(`${base}${AIGC_SESSIONS_PATH}/${sessionId}`, { method: "DELETE", headers: aigcHeaders(cookie, base) }).catch(() => {})
+  }
+  const fold = createAigcFold(toolNames, requestedModel)
+  // 只有正文/调用块算"已经推给客户端"；reasoning 不算（空答常带 thinking）。
+  let emitted = 0
+  const write = (controller) => (value) => {
+    const delta = value.choices?.[0]?.delta
+    if (delta && (delta.content || delta.tool_calls)) emitted += 1
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`))
+  }
+  const streamTransform = new TransformStream({
+    transform(bytes, controller) { fold.feed(bytes, write(controller)) },
+    async flush(controller) {
+      fold.finish(write(controller))
+      cleanup()
+      if (fold.sawError()) return
+      const tail = fold.tail()
+      if (toolNames.size && emitted === 0 && !tail.events.some((e) => e.type === "calls")) {
+        const round = { content: tail.text, reasoning: "", toolCalls: [] }
+        const kind = classifyToolRound(round, forcedName, requiresCall)
+        if (kind !== "clean") {
+          const retry = await consumeAigcRound({
+            base, cookie,
+            payload: makePayload(retryQuestion(question, round, kind, forcedName)),
+            requestedModel, toolNames, signal,
+          }).catch(() => null)
+          if (retry && !retry.error) {
+            for (const frame of roundFrames(retry, requestedModel)) controller.enqueue(encoder.encode(frame))
+            return
+          }
+        }
+      }
+      fold.complete(write(controller))
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+    },
+  })
+  return new Response(upstream.body.pipeThrough(streamTransform), {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  })
+}
+
+function aigcHeaders(cookie, base) {
+  return {
+    Cookie: clientCookie(cookie),
+    "Content-Type": "application/json",
+    "X-Cc-Version": "1",
+    "X-Client-Type": "lingxi-web",
+    "X-Cc-Entrance": "default",
+    "User-Agent": UA,
+    Referer: `${base}/`,
+  }
+}
+
+// 每个请求各建一个会话：同一 session 并发会返回 event:error。
+async function aigcCreateSession(base, cookie, signal) {
+  const response = await fetch(`${base}${AIGC_SESSIONS_PATH}`, {
+    method: "POST",
+    headers: aigcHeaders(cookie, base),
+    body: "{}",
+    signal,
+  })
+  if (!response.ok) {
+    const text = await response.text().catch(() => "")
+    const error = new Error(`WPS 灵犀网页会话建立失败: HTTP ${response.status}${text ? `：${text.slice(0, 200)}` : ""}`)
+    error.status = response.status
+    throw error
+  }
+  const data = await response.json().catch(() => null)
+  const id = String(data?.data?.session_id ?? "").trim()
+  if (!id) throw new Error("WPS 灵犀网页会话未返回 session_id")
+  return id
+}
+
+async function aigcChat({ cookie, base, body, stream, requestedModel, signal, errorResponse }) {
+  if (!isChatModelId(requestedModel)) {
+    return errorResponse(`WPS 灵犀不支持此聊天模型：${requestedModel}`, 404, "model_not_found")
+  }
+  const tools = TOOL_BRIDGE_ENABLED ? normalizeTools(body?.tools) : []
+  const toolNames = new Set(tools.map((t) => t.name))
+  const question = aigcQuestion(body, tools)
+
+  const effort = body?.reasoning_effort ?? body?.reasoningEffort ?? body?.thinking_level
+  // magpie / OpenCode 默认发 OpenAI 风格的 medium；minimal 是 reasoning 级别里的第 0 档。
+  // 上游只有 0/1/2 三档，medium 归中间档、minimal 归 0。不补会 400 Unsupported reasoning effort。
+  const effortMap = { low: "0", medium: "1", minimal: "0", high: "1", max: "2", "0": "0", "1": "1", "2": "2" }
+  const normalizedEffort = effort == null || effort === "" || !Object.hasOwn(effortMap, String(effort))
+    ? undefined : effortMap[String(effort)]
+  if (effort != null && effort !== "" && normalizedEffort === undefined) {
+    return errorResponse("Unsupported reasoning effort", 400, "invalid_reasoning_effort")
+  }
+
+  const makePayload = (q) => {
+    const payload = {
+      question: q,
+      expect_model: requestedModel,
+      model: requestedModel,
+      thinking: thinkingModeFor(normalizedEffort),
+      with_mcp: WITH_MCP,
+      with_expert: false,
+    }
+    if (normalizedEffort !== undefined) payload.reasoning_effort = normalizedEffort
+    return payload
+  }
+
+  const forcedName = forcedToolName(body?.tool_choice)
+  const requiresCall = Boolean(forcedName) || body?.tool_choice === "required" || body?.tool_choice?.type === "required"
+
+  // 流式：正文边到边推，工具调用块闭合解析成功后立即作为 SSE 帧推出；只有轮末
+  // 未解析的坏块会等，且仅当整轮零输出时重问。
+  if (stream) {
+    return aigcStreamThrough({
+      base, cookie,
+      payload: makePayload(question),
+      question, makePayload,
+      requestedModel, toolNames, forcedName, requiresCall, signal,
+    })
+  }
+
+  // 非流式：本来就要等整轮，顺手把坏轮次重问一遍。
+  let round = await consumeAigcRound({ base, cookie, payload: makePayload(question), requestedModel, toolNames, signal })
+  if (round.error) {
+    const status = round.error.code === "PromptTokenExceedLimit" ? 400 : chatErrorStatus({ status: 502, message: round.error.message, code: round.error.code })
+    return errorResponse(round.error.message, status, round.error.code)
+  }
+  const kind = tools.length ? classifyToolRound(round, forcedName, requiresCall) : "clean"
+  if (kind !== "clean") {
+    const retry = await consumeAigcRound({
+      base, cookie,
+      payload: makePayload(retryQuestion(question, round, kind, forcedName)),
+      requestedModel, toolNames, signal,
+    })
+    // 重问失败按原轮放行：干净 prose 是合法终态，重试不是拦截器。
+    if (!retry.error) round = retry
+  }
+
+  const hasToolCalls = round.toolCalls.length > 0
+  return new Response(JSON.stringify({
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: requestedModel,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: hasToolCalls ? (round.content || null) : round.content,
+        reasoning_content: round.reasoning || undefined,
+        ...(hasToolCalls ? { tool_calls: round.toolCalls } : {}),
+      },
+      finish_reason: hasToolCalls ? "tool_calls" : "stop",
+    }],
+  }), { headers: { "Content-Type": "application/json" } })
+}
+
 async function agentChat({ cookie, body, stream, requestedModel, signal, errorResponse, clientType, sessionMode }) {
   if (!isChatModelId(requestedModel)) {
     return errorResponse(`WPS 灵犀不支持此聊天模型：${requestedModel}`, 404, "model_not_found")
@@ -2424,10 +3301,14 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             const stream = body.stream !== false
             const requestedModel = wireModel(body.model)
 
-            // 桌面客户端只有一条通路：cowork 会话 → credits/run → agent-runtime。
-            // 网页平面（/api/aigc/v3/assistant/* 的 question 压平与正文工具桥）已移除。
+            // 2026-11：agent-runtime 平面被上游 403 门禁（官方桌面端同样被拒），
+            // 对话改走网页 aigc 平面（纯 HTTP、0 智点消耗）。
+            // MAGPIE_LINGXI_PLANE=agent 可切回桌面平面（上游恢复时 / 排障用）。
             try {
-              return await agentChat({ cookie, body, stream, requestedModel, signal, errorResponse })
+              if (process.env.MAGPIE_LINGXI_PLANE === "agent") {
+                return await agentChat({ cookie, body, stream, requestedModel, signal, errorResponse })
+              }
+              return await aigcChat({ cookie, base, body, stream, requestedModel, signal, errorResponse })
             } catch (error) {
               signal?.throwIfAborted()
               return errorResponse(error?.message || String(error), chatErrorStatus(error), chatErrorCode(error))
@@ -2620,6 +3501,10 @@ export const _internal = {
   createGroupChatWith,
   deleteGroupChat,
   agentChat,
+  aigcChat,
+  aigcQuestion,
+  createToolCallParser,
+  thinkingModeFor,
   sanitizeSchema,
   normalizeUsage,
   filterTools,

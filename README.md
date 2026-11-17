@@ -98,8 +98,7 @@ Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
 | 一次性任务·专家/客户端 | ✅ 已验证 | v0.3.15 的 `execution_status` 生命周期（running → 对话 → completed，真实内核抓包复刻）是真根因修复；未领账号实测两任务同时翻转并自动领取（issue #5） |
 | 脚手架 | ✅ | `check.mjs` 30 通过 / 0 警告 / 0 失败；`score.mjs` 身份门通过、自动分 65/65 |
 
-> 三个一次性任务的翻转已在未领账号实测通过（issue #5 三轮验证），
-> 过程与协议依据见 [`docs/ONE-TIME-TASKS.md`](./docs/ONE-TIME-TASKS.md)。
+> 三个一次性任务的翻转已在未领账号实测通过（issue #5 三轮验证）。
 
 ### 怎么验一次性任务
 

@@ -95,20 +95,22 @@ for (const id of ['auto', 'plan_pro', 'plan_max']) {
   }
 }
 
-test('a real model still reaches credits/runs and completes chat', async () => {
+test('a real model still completes chat through the web aigc plane', async () => {
   const plugin = await WPSLingxiAuthPlugin()
   const loader = await plugin.auth.loader(async () => ({ cookie: auth.cookie }))
   await withFetch((url, init) => {
     const path = new URL(url).pathname
-    if (path.endsWith('/cowork/sessions')) return Response.json({ data: { session_id: 'models-test-session' } })
-    if (path.endsWith('/credits/runs')) {
-      assert.equal(JSON.parse(init.body).model_id, 'kimi-k3')
-      return Response.json({ data: { run_id: 'models-test-run' } })
+    if (path === '/api/aigc/v3/assistant/sessions') return Response.json({ data: { session_id: 'models-test-session' } })
+    if (path.endsWith('/completions')) {
+      assert.equal(JSON.parse(init.body).expect_model, 'kimi-k3')
+      return new Response(
+        'event:execution\ndata:{"data":"","type":"text_start"}\n\n' +
+        'event:execution\ndata:{"data":"ok","type":"text"}\n\n' +
+        'event:aigc\ndata:{"data":null,"type":"end"}\n\n',
+        { headers: { 'Content-Type': 'text/event-stream' } },
+      )
     }
-    if (path.endsWith('/agent-runtime/chat/completions')) return new Response(
-      'data: {"choices":[{"text":"ok","finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
-      { headers: { 'Content-Type': 'text/event-stream' } },
-    )
+    if (init.method === 'DELETE') return Response.json({})
     throw new Error(`unexpected request: ${url}`)
   }, async calls => {
     const res = await loader.fetch('https://mock/chat/completions', {
@@ -116,9 +118,10 @@ test('a real model still reaches credits/runs and completes chat', async () => {
     })
     assert.equal(res.status, 200)
     assert.equal((await res.json()).choices[0].message.content, 'ok')
-    assert.deepEqual(calls.map(c => c.path), [
-      '/api/aioffice/v1/cowork/sessions', '/api/public/v1/credits/runs',
-      '/api/public/v1/agent-runtime/chat/completions',
+    assert.deepEqual(calls.filter(c => (c.init.method || 'GET') !== 'DELETE').map(c => c.path), [
+      '/api/aigc/v3/assistant/sessions', '/api/aigc/v3/assistant/sessions/models-test-session/completions',
     ])
+    // 会话用完即弃：每请求一个会话，结束顺手删掉。
+    assert.ok(calls.some(c => c.init.method === 'DELETE' && c.path.endsWith('/models-test-session')))
   })
 })

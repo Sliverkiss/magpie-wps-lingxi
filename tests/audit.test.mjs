@@ -1,4 +1,6 @@
 // Issue #7: exercise the public loader with mocked upstream; no real accounts/network.
+// 这组用例打的是桌面平面的端点，显式把平面切回 agent。
+process.env.MAGPIE_LINGXI_PLANE = "agent"
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { WPSLingxiAuthPlugin } from '../index.mjs'
