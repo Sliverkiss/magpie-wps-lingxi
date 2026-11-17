@@ -1096,12 +1096,73 @@ function fitAgentBody(body) {
   return { dropped: 0, elided }
 }
 
+// 上游的 tool_choice 只认字符串 auto / none / required：
+//   {type:"function",function:{name}}（OpenAI 形状）、{type:"tool",toolName}（AI SDK 原生形状）、
+//   {name}、{} —— 一律 400 InvalidArgument「参数错误」，整轮对话直接挂（Alma 就是这么挂的）；
+//   写成工具名字符串则回 AIError「AI服务异常」，也一样不能用。
+// 指定某个工具上游没法表达，压成 auto（模型仍可调工具，只是不强制）；其余非法串同样退 auto。
+function normalizeToolChoice(value) {
+  if (value == null) return undefined
+  if (typeof value === "string") {
+    const choice = value.trim().toLowerCase()
+    return choice === "auto" || choice === "none" || choice === "required" ? choice : "auto"
+  }
+  return "auto"
+}
+
+const IMAGE_NOTE = "[附了一张图片，当前通路不支持图片，只能看到这段文字]"
+const IMAGE_PARTS = new Set(["image", "image_url", "input_image", "file", "input_file"])
+
+// 桌面通路不吃内联图片：image_url / image / source.base64 三种写法都是
+// 400「参数错误」或直接 AIError，整轮对话跟着一起挂。
+// 这里把图片部分换成一句说明，让对话继续（模型会知道有图但看不到），不要因为一张截图废掉整轮。
+function dropImageParts(content) {
+  let changed = false
+  const parts = content.map((part) => {
+    if (!part || typeof part !== "object" || !IMAGE_PARTS.has(part.type)) return part
+    changed = true
+    return { type: "text", text: IMAGE_NOTE }
+  })
+  if (!changed) return content
+  return parts
+}
+
+// 上游要求 tool_calls[].function.arguments 是 JSON 字符串：
+// 传对象同样回 400「参数错误」。有些客户端（AI SDK 的部分适配器）会直接塞对象，这里统一串行化。
+function normalizeMessages(messages) {
+  if (!Array.isArray(messages)) return messages
+  let changed = false
+  const out = messages.map((message) => {
+    let next = message
+    if (Array.isArray(next?.content) && next.content.some((part) => IMAGE_PARTS.has(part?.type))) {
+      next = { ...next, content: dropImageParts(next.content) }
+      changed = true
+    }
+    if (!Array.isArray(next?.tool_calls) || !next.tool_calls.length) return next
+    let touched = false
+    const calls = next.tool_calls.map((call) => {
+      const args = call?.function?.arguments
+      if (typeof args === "string") return call
+      touched = true
+      return {
+        ...call,
+        function: { ...call?.function, arguments: args == null ? "{}" : JSON.stringify(args) },
+      }
+    })
+    if (!touched) return next
+    changed = true
+    return { ...next, tool_calls: calls }
+  })
+  return changed ? out : messages
+}
+
 function buildAgentBody(body, model) {
   const { tools } = filterTools(body.tools)
-  const out = { stream: true, model, messages: Array.isArray(body.messages) ? body.messages : [] }
+  const out = { stream: true, model, messages: normalizeMessages(Array.isArray(body.messages) ? body.messages : []) }
   if (tools.length) {
     out.tools = tools
-    if (body.tool_choice != null) out.tool_choice = body.tool_choice
+    const toolChoice = normalizeToolChoice(body.tool_choice)
+    if (toolChoice) out.tool_choice = toolChoice
   }
   if (typeof body.temperature === "number") out.temperature = body.temperature
   if (Number.isInteger(body.max_tokens) && body.max_tokens > 0) out.base_llm_arguments = { max_tokens: body.max_tokens }
@@ -1302,7 +1363,7 @@ function foldFrames(frames) {
   return result
 }
 
-async function requestAgent(cookie, run, payload, signal, clientType) {
+async function requestAgent(cookie, run, payload, signal, clientType, describe = null) {
   const response = await fetch(`${run.base}${AGENT_CHAT_PATH}`, {
     method: "POST",
     headers: agentHeaders(cookie, run.base, {
@@ -1315,14 +1376,19 @@ async function requestAgent(cookie, run, payload, signal, clientType) {
   })
   if (!response.ok) {
     const text = await response.text().catch(() => "")
+    // 上游只回一句「参数错误」，不说是哪个参数。把请求特征一起打出来，
+    // 下次再挂能一眼看出是形状问题还是内容问题，不用再去猜客户端发了什么。
+    if (describe) {
+      console.warn(`[magpie-wps-lingxi] 上游 ${response.status}：${text.slice(0, 200)}｜${describe()}`)
+    }
     const error = new Error(`WPS 灵犀上游返回 ${response.status}${text ? `：${text.slice(0, 200)}` : ""}`)
     error.status = response.status
     // 在截断展示文案前检查完整错误体，避免丢失末尾的审核标识。
-    let payload
-    try { payload = JSON.parse(text) } catch { payload = { message: text } }
-    const upstreamCode = upstreamErrorCode(payload)
+    let errorBody
+    try { errorBody = JSON.parse(text) } catch { errorBody = { message: text } }
+    const upstreamCode = upstreamErrorCode(errorBody)
     if (upstreamCode) error.upstreamCode = upstreamCode
-    if (isAuditError(payload)) error.code = "audit_blocked"
+    if (isAuditError(errorBody)) error.code = "audit_blocked"
     if (isPermissionDenied(error)) invalidateRun(run)
     throw error
   }
@@ -1359,15 +1425,35 @@ async function agentChat({ cookie, body, stream, requestedModel, signal, errorRe
     ...(clientType ? { clientType } : {}),
     ...(sessionMode === "expert" ? { currentMode: "expert" } : {}),
   }
+  // 出事时打得出来的那行字：客户端多带了什么、工具和消息是什么形状、发上去多大。
+  const describeRequest = () => {
+    const dropped = ["model", "stream", "messages", "tools", "tool_choice"]
+    const extra = Object.keys(body ?? {}).filter((key) => !dropped.includes(key))
+    const argumentTypes = new Set()
+    for (const message of body?.messages ?? []) {
+      for (const call of message?.tool_calls ?? []) argumentTypes.add(typeof call?.function?.arguments)
+    }
+    const shapes = {
+      model: requestedModel,
+      keys: extra.length ? extra.join(",") : "-",
+      tool_choice: body?.tool_choice == null ? "null" : `${typeof body.tool_choice}→${payload.tool_choice ?? "drop"}`,
+      tools: Array.isArray(body?.tools) ? body.tools.length : 0,
+      messages: Array.isArray(body?.messages) ? body.messages.length : 0,
+      sent: Array.isArray(payload.messages) ? payload.messages.length : 0,
+      args: [...argumentTypes].join("/") || "-",
+      bytes: byteLength(JSON.stringify(payload)),
+    }
+    return Object.entries(shapes).map(([key, value]) => `${key}=${value}`).join(" ")
+  }
   let run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)
   let response
   try {
-    response = await requestAgent(cookie, run, payload, signal, clientType)
+    response = await requestAgent(cookie, run, payload, signal, clientType, describeRequest)
   } catch (error) {
     if (isAuditError(error) || !looksLikeStaleRun(error.message)) throw error
     runs.delete(key)
     run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)
-    response = await requestAgent(cookie, run, payload, signal, clientType)
+    response = await requestAgent(cookie, run, payload, signal, clientType, describeRequest)
   }
 
   const translator = new LingxiTranslator(requestedModel)

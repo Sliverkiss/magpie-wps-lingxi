@@ -126,6 +126,112 @@ test('tools go through agent-runtime and come back as chat SSE', async () => {
   }
 })
 
+// Alma（AI SDK）会发 {type:"function",function:{name}} 形状的 tool_choice，
+// 下游桌面通路对这个形状只回 400 InvalidArgument「参数错误」，整轮挂掉。
+test('tool_choice is flattened to what upstream accepts', async () => {
+  const plugin = await WPSLingxiAuthPlugin()
+  const loader = await plugin.auth.loader(async () => ({ cookie: COOKIE }))
+  const net = installFetch(agentRoutes(() => sse([
+    { code: 'Success', choices: [{ index: 0, text: '答', finish_reason: 'stop' }] },
+  ])))
+  const tool = { type: 'function', function: { name: 'get_weather', parameters: {} } }
+  try {
+    for (const choice of [
+      { type: 'function', function: { name: 'get_weather' } },
+      { type: 'tool', toolName: 'get_weather' },
+      { name: 'get_weather' },
+      {},
+      'get_weather',
+      'AUTO',
+    ]) {
+      net.calls.length = 0
+      await loader.fetch('https://mock', {
+        body: JSON.stringify({
+          model: 'wps-lingxi/GLM-5.3',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [tool],
+          tool_choice: choice,
+        }),
+      })
+      const chat = net.calls.find((call) => call.url.includes('/agent-runtime/chat/completions'))
+      assert.equal(chat.body.tool_choice, 'auto', `tool_choice ${JSON.stringify(choice)} must become auto`)
+    }
+    for (const [sent, expected] of [['auto', 'auto'], ['none', 'none'], ['required', 'required']]) {
+      net.calls.length = 0
+      await loader.fetch('https://mock', {
+        body: JSON.stringify({
+          model: 'wps-lingxi/GLM-5.3',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [tool],
+          tool_choice: sent,
+        }),
+      })
+      const chat = net.calls.find((call) => call.url.includes('/agent-runtime/chat/completions'))
+      assert.equal(chat.body.tool_choice, expected)
+    }
+  } finally {
+    net.restore()
+  }
+})
+
+test('tool call arguments written as objects are sent as JSON strings', async () => {
+  const plugin = await WPSLingxiAuthPlugin()
+  const loader = await plugin.auth.loader(async () => ({ cookie: COOKIE }))
+  const net = installFetch(agentRoutes(() => sse([
+    { code: 'Success', choices: [{ index: 0, text: '答', finish_reason: 'stop' }] },
+  ])))
+  try {
+    await loader.fetch('https://mock', {
+      body: JSON.stringify({
+        model: 'wps-lingxi/GLM-5.3',
+        stream: true,
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: { city: '北京' } } }] },
+          { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+        ],
+      }),
+    })
+    const chat = net.calls.find((call) => call.url.includes('/agent-runtime/chat/completions'))
+    assert.equal(chat.body.messages[1].tool_calls[0].function.arguments, '{"city":"北京"}')
+  } finally {
+    net.restore()
+  }
+})
+
+test('inline images become a text note instead of failing the turn', async () => {
+  const plugin = await WPSLingxiAuthPlugin()
+  const loader = await plugin.auth.loader(async () => ({ cookie: COOKIE }))
+  const net = installFetch(agentRoutes(() => sse([
+    { code: 'Success', choices: [{ index: 0, text: '答', finish_reason: 'stop' }] },
+  ])))
+  try {
+    const res = await loader.fetch('https://mock', {
+      body: JSON.stringify({
+        model: 'wps-lingxi/GLM-5.3',
+        stream: true,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: '图里是什么' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          ],
+        }],
+      }),
+    })
+    assert.equal(res.status, 200)
+    const chat = net.calls.find((call) => call.url.includes('/agent-runtime/chat/completions'))
+    const parts = chat.body.messages[0].content
+    assert.equal(parts[0].text, '图里是什么')
+    assert.equal(parts[1].type, 'text')
+    assert.doesNotMatch(JSON.stringify(chat.body), /image_url/)
+  } finally {
+    net.restore()
+  }
+})
+
 test('non-stream tool calls are folded with their arguments joined', async () => {
   const plugin = await WPSLingxiAuthPlugin()
   const loader = await plugin.auth.loader(async () => ({ cookie: COOKIE }))

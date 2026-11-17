@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.6 — 2026-11-17
+
+- 修复 Alma（AI SDK）里整轮对话直接报 400「参数错误」：`tool_choice` 传对象
+  （`{type:"function",function:{name}}` / `{type:"tool",toolName}` / `{name}` / `{}`）或工具名字符串时，
+  桌面通路只回 `400 InvalidArgument`。现在统一压成上游认的 `auto` / `none` / `required`。
+- `tool_calls[].function.arguments` 传对象同样会 400，现在统一串行化成 JSON 字符串。
+- 内联图片（`image_url` / `image` / `source.base64`）在这条通路上必挂，改成一句文字说明，别因为一张截图废掉整轮。
+- 上游报错时多打一行请求特征（多带了哪些键、tool_choice 形状、工具数、消息数、字节数），下次挂了能直接定位。
+
 ## 0.3.5 — 2026-11-16
 
 - 修复 Issue #17：总智点窗口报告最早到期时间和该到期批次的实际余额，保留顶层 `until` 供展示。
